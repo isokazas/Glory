@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Prepare move-only human PGNs and Stockfish-labelled Glory training records.
 
-This produces a raw Rec[] sidecar in the exact 36-byte little-endian layout
-used by glory_nnue.c. The matching C replay-loader integration is documented
-in README-teacher-data.md; do not overwrite existing gen_*.bin files or state.
+Writes a raw Rec[] sidecar in the exact 36-byte little-endian layout used by
+Glory's current trainer. The current C trainer does not yet load this sidecar;
+that replay integration must land before these records affect training.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -23,7 +24,7 @@ except ImportError:
 
 SCORE_NONE = 32767
 MAX_SCORE_CP = 2000
-REC = __import__("struct").Struct("<32Bb h")
+REC = struct.Struct("<32BBbh")
 
 
 def pack_board(board: chess.Board) -> bytes:
@@ -31,24 +32,22 @@ def pack_board(board: chess.Board) -> bytes:
     for sq, piece in board.piece_map().items():
         # C enum: white P..K = 0..5, black P..K = 6..11; empty nibble = 0.
         pc = piece.piece_type - 1 + (0 if piece.color == chess.WHITE else 6)
-        nibble = pc + 1
-        packed[sq >> 1] |= nibble << ((sq & 1) * 4)
+        packed[sq >> 1] |= (pc + 1) << ((sq & 1) * 4)
     return bytes(packed)
 
 
-def result_for_side_to_move(result: str, turn: bool) -> int:
+def white_result(result: str) -> int:
+    """Rec.result is white-relative; C training flips it for black-to-move."""
     if result == "1-0":
-        white_result = 1
-    elif result == "0-1":
-        white_result = -1
-    else:
-        white_result = 0
-    return white_result if turn == chess.WHITE else -white_result
+        return 1
+    if result == "0-1":
+        return -1
+    return 0
 
 
 def clean_mainline(game: chess.pgn.Game) -> str:
-    # Keep only useful PGN headers and the mainline: no comments, NAGs,
-    # side variations, clock annotations, or embedded engine analysis.
+    # Keep only useful headers and mainline moves: no comments, NAGs, side
+    # variations, clock annotations, or embedded engine analysis.
     result = game.headers.get("Result", "*")
     white = game.headers.get("White", "White")
     black = game.headers.get("Black", "Black")
@@ -80,7 +79,8 @@ def main() -> int:
     ap.add_argument("--out-dir", type=Path, required=True,
                     help="normally /run/media/brpr/Glory/glory_nnue/data")
     ap.add_argument("--stockfish", default="stockfish", help="Stockfish UCI executable")
-    ap.add_argument("--depth", type=int, default=10, help="Stockfish analysis depth per position (0 disables teacher scores)")
+    ap.add_argument("--depth", type=int, default=10,
+                    help="Stockfish analysis depth per position (0 disables teacher scores)")
     ap.add_argument("--limit-games", type=int, default=0, help="maximum imported games; 0 imports all")
     ap.add_argument("--max-plies", type=int, default=400, help="ignore moves after this ply")
     args = ap.parse_args()
@@ -133,11 +133,10 @@ def main() -> int:
                                 info = engine.analyse(board, chess.engine.Limit(depth=args.depth))
                                 cp = info["score"].pov(board.turn).score(mate_score=MAX_SCORE_CP)
                                 cp = max(-MAX_SCORE_CP, min(MAX_SCORE_CP, cp if cp is not None else 0))
-                                score_cp = cp
                                 scored += 1
                             stm = 0 if board.turn == chess.WHITE else 1
-                            outcome = result_for_side_to_move(result, board.turn)
-                            game_records.extend(REC.pack(pack_board(board), stm, outcome, score_cp))
+                            game_records.extend(REC.pack(pack_board(board), stm,
+                                                         white_result(result), score_cp))
                         board.push(move)
 
                     if not game_records:
@@ -158,8 +157,7 @@ def main() -> int:
     out_dir = args.out_dir
     atomic_write(out_dir / "outsider.bin", bytes(records))
     # Human-readable, annotation-free mainlines for online replay/analysis.
-    pgn_text = "\n".join(cleaned).encode("utf-8")
-    atomic_write(out_dir / "outsider_moves.pgn", pgn_text)
+    atomic_write(out_dir / "outsider_moves.pgn", "\n".join(cleaned).encode("utf-8"))
     print(f"Imported {imported} outsider games and {positions} positions "
           f"({scored} Stockfish-labelled).\n"
           f"Records: {out_dir / 'outsider.bin'}\n"
