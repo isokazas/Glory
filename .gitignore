@@ -1,0 +1,13 @@
+# Training outputs and checkpoints
+glory_nnue/
+data/
+nets/
+*.bin
+*.pgn
+*.log
+*.csv
+
+# Compiled programs and temporary files
+glory_nnue
+*.o
+*.tmp
